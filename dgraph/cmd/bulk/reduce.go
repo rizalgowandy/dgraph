@@ -43,7 +43,7 @@ import (
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/dgraph-io/ristretto/z"
-	"github.com/dgraph-io/roaring/roaring64"
+	"github.com/dgraph-io/sroar"
 	"github.com/dustin/go-humanize"
 	"github.com/golang/snappy"
 )
@@ -435,11 +435,9 @@ func bufferStats(cbuf *z.Buffer) {
 }
 
 func getBuf(dir string) *z.Buffer {
-	cbuf, err := z.NewBufferWithDir(64<<20, 64<<30, z.UseCalloc,
-		filepath.Join(dir, bufferDir), "Reducer.GetBuf")
-	x.Check(err)
-	cbuf.AutoMmapAfter(1 << 30)
-	return cbuf
+	return z.NewBuffer(64<<20, "Reducer.GetBuf").
+		WithAutoMmap(1<<30, filepath.Join(dir, bufferDir)).
+		WithMaxSize(64 << 30)
 }
 
 func (r *reducer) reduce(partitionKeys [][]byte, mapItrs []*mapIterator, ci *countIndexer) {
@@ -594,7 +592,7 @@ func (r *reducer) toList(req *encodeRequest) {
 			}
 		}
 
-		bm := roaring64.New()
+		bm := sroar.NewBitmap()
 		var lastUid uint64
 		slice, next := []byte{}, start
 		for next >= 0 && (next < end || end == -1) {
@@ -607,7 +605,7 @@ func (r *reducer) toList(req *encodeRequest) {
 			}
 			lastUid = uid
 
-			bm.Add(uid)
+			bm.Set(uid)
 			if pbuf := me.Plist(); len(pbuf) > 0 {
 				p := getPosting()
 				x.Check(p.Unmarshal(pbuf))
@@ -649,9 +647,7 @@ func (r *reducer) toList(req *encodeRequest) {
 			}
 		}
 
-		shouldSplit, err := posting.ShouldSplit(pl)
-		x.Check(err)
-		if shouldSplit {
+		if posting.ShouldSplit(pl) {
 			// Give ownership of pl.Pack away to list. Rollup would deallocate the Pack.
 			l := posting.NewList(y.Copy(currentKey), pl, writeVersionTs)
 			kvs, err := l.Rollup(nil)

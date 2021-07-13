@@ -185,7 +185,7 @@ func GetGQLSchema(namespace uint64) (uid, graphQLSchema string, err error) {
 	sort.Slice(res, func(i, j int) bool {
 		return res[i].UidInt < res[j].UidInt
 	})
-	glog.Errorf("Multiple schema node found, using the last one")
+	glog.Errorf("namespace: %d. Multiple schema nodes found, using the last one", namespace)
 	resLast := res[len(res)-1]
 	return resLast.Uid, resLast.Schema, nil
 }
@@ -271,7 +271,9 @@ func parseSchemaFromAlterOperation(ctx context.Context, op *api.Operation) (*sch
 		// Only the guardian of the galaxy can do a galaxy wide query/mutation. This operation is
 		// needed by live loader.
 		if err := AuthGuardianOfTheGalaxy(ctx); err != nil {
-			return nil, errors.Wrap(err, "Non guardian of galaxy user cannot bypass namespaces.")
+			s := status.Convert(err)
+			return nil, status.Error(s.Code(),
+				"Non guardian of galaxy user cannot bypass namespaces. "+s.Message())
 		}
 		var err error
 		namespace, err = strconv.ParseUint(x.GetForceNamespace(ctx), 0, 64)
@@ -398,8 +400,9 @@ func (s *Server) Alter(ctx context.Context, op *api.Operation) (*api.Payload, er
 			return empty, errors.New("Drop all operation is not permitted.")
 		}
 		if err := AuthGuardianOfTheGalaxy(ctx); err != nil {
-			return empty, errors.Wrapf(err, "Drop all can only be called by the guardian of the"+
-				" galaxy")
+			s := status.Convert(err)
+			return empty, status.Error(s.Code(),
+				"Drop all can only be called by the guardian of the galaxy. "+s.Message())
 		}
 		if len(op.DropValue) > 0 {
 			return empty, errors.Errorf("If DropOp is set to ALL, DropValue must be empty")
@@ -426,14 +429,6 @@ func (s *Server) Alter(ctx context.Context, op *api.Operation) (*api.Payload, er
 	}
 
 	if op.DropOp == api.Operation_DATA {
-		if x.Config.BlockClusterWideDrop {
-			glog.V(2).Info("Blocked drop-data because it is not permitted.")
-			return empty, errors.New("Drop data operation is not permitted.")
-		}
-		if err := AuthGuardianOfTheGalaxy(ctx); err != nil {
-			return empty, errors.Wrapf(err, "Drop data can only be called by the guardian of the"+
-				" galaxy")
-		}
 		if len(op.DropValue) > 0 {
 			return empty, errors.Errorf("If DropOp is set to DATA, DropValue must be empty")
 		}
@@ -445,13 +440,14 @@ func (s *Server) Alter(ctx context.Context, op *api.Operation) (*api.Payload, er
 		}
 
 		m.DropOp = pb.Mutations_DATA
+		m.DropValue = fmt.Sprintf("%#x", namespace)
 		_, err = query.ApplyMutations(ctx, m)
 		if err != nil {
 			return empty, err
 		}
 
 		// insert a helper record for backup & restore, indicating that drop_data was done
-		err = InsertDropRecord(ctx, "DROP_DATA;")
+		err = InsertDropRecord(ctx, fmt.Sprintf("DROP_DATA;%#x", namespace))
 		if err != nil {
 			return empty, err
 		}
@@ -459,7 +455,7 @@ func (s *Server) Alter(ctx context.Context, op *api.Operation) (*api.Payload, er
 		// just reinsert the GraphQL schema, no need to alter dgraph schema as this was drop_data
 		_, err = UpdateGQLSchema(ctx, graphQLSchema, "")
 		// recreate the admin account after a drop data operation
-		ResetAcl(nil)
+		upsertGuardianAndGroot(nil, namespace)
 		return empty, err
 	}
 
@@ -538,9 +534,16 @@ func (s *Server) Alter(ctx context.Context, op *api.Operation) (*api.Payload, er
 	// TODO: Maybe add some checks about the schema.
 	m.Schema = result.Preds
 	m.Types = result.Types
-	_, err = query.ApplyMutations(ctx, m)
+	for i := 0; i < 3; i++ {
+		_, err = query.ApplyMutations(ctx, m)
+		if err != nil && strings.Contains(err.Error(), "Please retry operation") {
+			time.Sleep(time.Second)
+			continue
+		}
+		break
+	}
 	if err != nil {
-		return empty, err
+		return empty, errors.Wrapf(err, "During ApplyMutations")
 	}
 
 	// wait for indexing to complete or context to be canceled.
@@ -690,8 +693,12 @@ func validateDQLSchemaForGraphQL(ctx context.Context,
 	return nil
 }
 
+func annotateNamespace(span *otrace.Span, ns uint64) {
+	span.AddAttributes(otrace.Int64Attribute("ns", int64(ns)))
+}
+
 func annotateStartTs(span *otrace.Span, ts uint64) {
-	span.Annotate([]otrace.Attribute{otrace.Int64Attribute("startTs", int64(ts))}, "")
+	span.AddAttributes(otrace.Int64Attribute("startTs", int64(ts)))
 }
 
 func (s *Server) doMutate(ctx context.Context, qc *queryContext, resp *api.Response) error {
@@ -1195,16 +1202,7 @@ func filterTablets(ctx context.Context, ms *pb.MembershipState) error {
 		return errors.Errorf("Namespace not found in JWT.")
 	}
 	if namespace == x.GalaxyNamespace {
-		// For galaxy namespace, we don't want to filter out the predicates. We only format the
-		// namespace to human readable form.
-		for _, group := range ms.Groups {
-			tablets := make(map[string]*pb.Tablet)
-			for tabletName, tablet := range group.Tablets {
-				tablet.Predicate = x.FormatNsAttr(tablet.Predicate)
-				tablets[x.FormatNsAttr(tabletName)] = tablet
-			}
-			group.Tablets = tablets
-		}
+		// For galaxy namespace, we don't want to filter out the predicates.
 		return nil
 	}
 	for _, group := range ms.GetGroups() {
@@ -1258,6 +1256,16 @@ func getAuthMode(ctx context.Context) AuthMode {
 // QueryGraphQL handles only GraphQL queries, neither mutations nor DQL.
 func (s *Server) QueryGraphQL(ctx context.Context, req *api.Request,
 	field gqlSchema.Field) (*api.Response, error) {
+	// Add a timeout for queries which don't have a deadline set. We don't want to
+	// apply a timeout if it's a mutation, that's currently handled by flag
+	// "txn-abort-after".
+	if req.GetMutations() == nil && x.Config.QueryTimeout != 0 {
+		if d, _ := ctx.Deadline(); d.IsZero() {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, x.Config.QueryTimeout)
+			defer cancel()
+		}
+	}
 	// no need to attach namespace here, it is already done by GraphQL layer
 	return s.doQuery(ctx, &Request{req: req, gqlField: field, doAuth: getAuthMode(ctx)})
 }
@@ -1296,8 +1304,7 @@ func Init() {
 	maxPendingQueries = x.Config.Limit.GetInt64("max-pending-queries")
 }
 
-func (s *Server) doQuery(ctx context.Context, req *Request) (
-	resp *api.Response, rerr error) {
+func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response, rerr error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -1328,6 +1335,10 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (
 
 	var measurements []ostats.Measurement
 	ctx, span := otrace.StartSpan(ctx, methodRequest)
+	if ns, err := x.ExtractNamespace(ctx); err == nil {
+		annotateNamespace(span, ns)
+	}
+
 	ctx = x.WithMethod(ctx, methodRequest)
 	defer func() {
 		span.End()
@@ -1363,11 +1374,13 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (
 		ostats.Record(ctx, x.NumMutations.M(1))
 	}
 
-	if x.IsGalaxyOperation(ctx) {
+	if req.doAuth == NeedAuthorize && x.IsGalaxyOperation(ctx) {
 		// Only the guardian of the galaxy can do a galaxy wide query/mutation. This operation is
 		// needed by live loader.
 		if err := AuthGuardianOfTheGalaxy(ctx); err != nil {
-			return nil, errors.Wrap(err, "Non guardian of galaxy user cannot bypass namespaces.")
+			s := status.Convert(err)
+			return nil, status.Error(s.Code(),
+				"Non guardian of galaxy user cannot bypass namespaces. "+s.Message())
 		}
 	}
 
@@ -1396,6 +1409,18 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (
 		start := time.Now()
 		req.req.StartTs = worker.State.GetTimestamp(false)
 		qc.latency.AssignTimestamp = time.Since(start)
+	}
+	if x.WorkerConfig.AclEnabled {
+		ns, err := x.ExtractNamespace(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if resp != nil && resp.Txn != nil {
+				// attach the hash, user must send this hash when further operating on this startTs.
+				resp.Txn.Hash = getHash(ns, resp.Txn.StartTs)
+			}
+		}()
 	}
 
 	var gqlErrs error
@@ -1429,14 +1454,6 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (
 		ProcessingNs:      uint64(l.Processing.Nanoseconds()),
 		EncodingNs:        uint64(l.Json.Nanoseconds()),
 		TotalNs:           uint64((time.Since(l.Start)).Nanoseconds()),
-	}
-	if x.WorkerConfig.AclEnabled {
-		// attach the hash, user should send this hash when further operating on this startTs.
-		ns, err := x.ExtractNamespace(ctx)
-		if err != nil {
-			return nil, err
-		}
-		resp.Txn.Hash = getHash(ns, resp.Txn.StartTs)
 	}
 	md := metadata.Pairs(x.DgraphCostHeader, fmt.Sprint(resp.Metrics.NumUids["_total"]))
 	grpc.SendHeader(ctx, md)
@@ -1540,8 +1557,8 @@ func processQuery(ctx context.Context, qc *queryContext) (*api.Response, error) 
 		// If the list of UIDs is empty but the map of values is not,
 		// we need to get the UIDs from the keys in the map.
 		var uidList []uint64
-		if v.OrderedUIDs != nil && len(v.OrderedUIDs.Uids) > 0 {
-			uidList = v.OrderedUIDs.Uids
+		if v.OrderedUIDs != nil && len(v.OrderedUIDs.SortedUids) > 0 {
+			uidList = v.OrderedUIDs.SortedUids
 		} else if !v.UidMap.IsEmpty() {
 			uidList = v.UidMap.ToArray()
 		} else {
@@ -1681,6 +1698,9 @@ func (s *Server) CommitOrAbort(ctx context.Context, tc *api.TxnContext) (*api.Tx
 	if tc.StartTs == 0 {
 		return &api.TxnContext{}, errors.Errorf(
 			"StartTs cannot be zero while committing a transaction")
+	}
+	if ns, err := x.ExtractJWTNamespace(ctx); err == nil {
+		annotateNamespace(span, ns)
 	}
 	annotateStartTs(span, tc.StartTs)
 

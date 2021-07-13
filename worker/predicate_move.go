@@ -79,7 +79,7 @@ func batchAndProposeKeyValues(ctx context.Context, kvs chan *pb.KVS) error {
 	var pk x.ParsedKey
 
 	for kvPayload := range kvs {
-		buf := z.BufferFrom(kvPayload.GetData())
+		buf := z.NewBufferSlice(kvPayload.GetData())
 		err := buf.SliceIterate(func(s []byte) error {
 			kv := &bpb.KV{}
 			x.Check(kv.Unmarshal(s))
@@ -97,8 +97,9 @@ func batchAndProposeKeyValues(ctx context.Context, kvs chan *pb.KVS) error {
 
 				glog.Infof("Predicate being received: %v", pk.Attr)
 				if kv.StreamId == CleanPredicate {
-					// Delete on all nodes.
-					p := &pb.Proposal{CleanPredicate: pk.Attr}
+					// Delete on all nodes. Remove the schema at timestamp kv.Version-1 and set it at
+					// kv.Version. kv.Version will be the TxnTs of the predicate move.
+					p := &pb.Proposal{CleanPredicate: pk.Attr, StartTs: kv.Version - 1}
 					if err := n.proposeAndWait(ctx, p); err != nil {
 						glog.Errorf("Error while cleaning predicate %v %v\n", pk.Attr, err)
 						return err
@@ -174,7 +175,7 @@ func (w *grpcWorker) ReceivePredicate(stream pb.Worker_ReceivePredicateServer) e
 		}
 		glog.V(2).Infof("Received batch of size: %s\n", humanize.IBytes(uint64(len(kvBuf.Data))))
 
-		buf := z.BufferFrom(kvBuf.Data)
+		buf := z.NewBufferSlice(kvBuf.Data)
 		buf.SliceIterate(func(_ []byte) error {
 			count++
 			return nil
@@ -223,7 +224,11 @@ func (w *grpcWorker) MovePredicate(ctx context.Context,
 		// know that they are no longer serving this predicate, before they delete it from their
 		// state. Without this checksum, the members could end up deleting the predicate and then
 		// serve a request asking for that predicate, causing Jepsen failures.
-		p := &pb.Proposal{CleanPredicate: in.Predicate, ExpectedChecksum: in.ExpectedChecksum}
+		p := &pb.Proposal{
+			CleanPredicate:   in.Predicate,
+			ExpectedChecksum: in.ExpectedChecksum,
+			StartTs:          in.ReadTs,
+		}
 		return &emptyPayload, groups().Node.proposeAndWait(ctx, p)
 	}
 	if err := posting.Oracle().WaitForTs(ctx, in.ReadTs); err != nil {
@@ -274,8 +279,6 @@ func movePredicateHelper(ctx context.Context, in *pb.MovePredicatePayload) error
 		return errors.Wrapf(err, "while calling ReceivePredicate")
 	}
 
-	// This txn is only reading the schema. Doesn't really matter what read timestamp we use,
-	// because schema keys are always set at ts=1.
 	txn := pstore.NewTransactionAt(in.ReadTs, false)
 	defer txn.Discard()
 
@@ -299,10 +302,10 @@ func movePredicateHelper(ctx context.Context, in *pb.MovePredicatePayload) error
 		kv := &bpb.KV{}
 		kv.Key = schemaKey
 		kv.Value = val
-		kv.Version = 1
+		kv.Version = in.ReadTs
 		kv.UserMeta = []byte{item.UserMeta()}
 		if in.SinceTs == 0 {
-			// When doing phase 1 of predicate move, receiver should clean the predicate.
+			// When doing Phase I of predicate move, receiver should clean the predicate.
 			kv.StreamId = CleanPredicate
 		}
 		badger.KVToBuffer(kv, buf)

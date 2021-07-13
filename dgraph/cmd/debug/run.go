@@ -36,6 +36,7 @@ import (
 	"github.com/dgraph-io/badger/v3"
 	bpb "github.com/dgraph-io/badger/v3/pb"
 	"github.com/dgraph-io/ristretto/z"
+	"github.com/dustin/go-humanize"
 
 	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/ee"
@@ -69,6 +70,7 @@ type flagOptions struct {
 	noKeys        bool
 	namespace     uint64
 	key           x.Sensitive
+	onlySummary   bool
 
 	// Options related to the WAL.
 	wdir           string
@@ -104,6 +106,10 @@ func init() {
 	flag.StringVarP(&opt.pdir, "postings", "p", "", "Directory where posting lists are stored.")
 	flag.BoolVar(&opt.sizeHistogram, "histogram", false,
 		"Show a histogram of the key and value sizes.")
+	flag.BoolVar(&opt.onlySummary, "only-summary", false,
+		"If true, only show the summary of the p directory.")
+
+	// Flags related to WAL.
 	flag.StringVarP(&opt.wdir, "wal", "w", "", "Directory where Raft write-ahead logs are stored.")
 	flag.Uint64VarP(&opt.wtruncateUntil, "truncate", "t", 0,
 		"Remove data from Raft entries until but not including this index.")
@@ -418,6 +424,7 @@ func history(lookup []byte, itr *badger.Iterator) {
 			r := codec.FromBytes(plist.Bitmap)
 			fmt.Fprintf(&buf, " Num uids = %d. Size = %d\n",
 				r.GetCardinality(), len(plist.Bitmap))
+
 			itr := r.ManyIterator()
 			uids := make([]uint64, 256)
 			for {
@@ -678,99 +685,6 @@ func printKeys(db *badger.DB) {
 	fmt.Printf("Found %d keys\n", atomic.LoadUint64(&total))
 }
 
-// Creates bounds for an histogram. The bounds are powers of two of the form
-// [2^min_exponent, ..., 2^max_exponent].
-func getHistogramBounds(minExponent, maxExponent uint32) []float64 {
-	var bounds []float64
-	for i := minExponent; i <= maxExponent; i++ {
-		bounds = append(bounds, float64(int(1)<<i))
-	}
-	return bounds
-}
-
-// HistogramData stores the information needed to represent the sizes of the keys and values
-// as a histogram.
-type HistogramData struct {
-	Bounds         []float64
-	Count          int64
-	CountPerBucket []int64
-	Min            int64
-	Max            int64
-	Sum            int64
-}
-
-// NewHistogramData returns a new instance of HistogramData with properly initialized fields.
-func NewHistogramData(bounds []float64) *HistogramData {
-	return &HistogramData{
-		Bounds:         bounds,
-		CountPerBucket: make([]int64, len(bounds)+1),
-		Max:            0,
-		Min:            math.MaxInt64,
-	}
-}
-
-// Update changes the Min and Max fields if value is less than or greater than the current values.
-func (histogram *HistogramData) Update(value int64) {
-	if value > histogram.Max {
-		histogram.Max = value
-	}
-	if value < histogram.Min {
-		histogram.Min = value
-	}
-
-	histogram.Sum += value
-	histogram.Count++
-
-	for index := 0; index <= len(histogram.Bounds); index++ {
-		// Allocate value in the last buckets if we reached the end of the Bounds array.
-		if index == len(histogram.Bounds) {
-			histogram.CountPerBucket[index]++
-			break
-		}
-
-		if value < int64(histogram.Bounds[index]) {
-			histogram.CountPerBucket[index]++
-			break
-		}
-	}
-}
-
-// PrintHistogram prints the histogram data in a human-readable format.
-func (histogram *HistogramData) PrintHistogram() {
-	if histogram == nil {
-		return
-	}
-
-	fmt.Printf("Min value: %d\n", histogram.Min)
-	fmt.Printf("Max value: %d\n", histogram.Max)
-	fmt.Printf("Mean: %.2f\n", float64(histogram.Sum)/float64(histogram.Count))
-	fmt.Printf("%24s %9s\n", "Range", "Count")
-
-	numBounds := len(histogram.Bounds)
-	for index, count := range histogram.CountPerBucket {
-		if count == 0 {
-			continue
-		}
-
-		// The last bucket represents the bucket that contains the range from
-		// the last bound up to infinity so it's processed differently than the
-		// other buckets.
-		if index == len(histogram.CountPerBucket)-1 {
-			lowerBound := int(histogram.Bounds[numBounds-1])
-			fmt.Printf("[%10d, %10s) %9d\n", lowerBound, "infinity", count)
-			continue
-		}
-
-		upperBound := int(histogram.Bounds[index])
-		lowerBound := 0
-		if index > 0 {
-			lowerBound = int(histogram.Bounds[index-1])
-		}
-
-		fmt.Printf("[%10d, %10d) %9d\n", lowerBound, upperBound, count)
-	}
-}
-
 func sizeHistogram(db *badger.DB) {
 	txn := db.NewTransactionAt(opt.readTs, false)
 	defer txn.Discard()
@@ -782,12 +696,12 @@ func sizeHistogram(db *badger.DB) {
 
 	// Generate distribution bounds. Key sizes are not greater than 2^16 while
 	// value sizes are not greater than 1GB (2^30).
-	keyBounds := getHistogramBounds(5, 16)
-	valueBounds := getHistogramBounds(5, 30)
+	keyBounds := z.HistogramBounds(5, 16)
+	valueBounds := z.HistogramBounds(5, 30)
 
 	// Initialize exporter.
-	keySizeHistogram := NewHistogramData(keyBounds)
-	valueSizeHistogram := NewHistogramData(valueBounds)
+	keySizeHistogram := z.NewHistogramData(keyBounds)
+	valueSizeHistogram := z.NewHistogramData(valueBounds)
 
 	// Collect key and value sizes.
 	var prefix []byte
@@ -806,10 +720,8 @@ func sizeHistogram(db *badger.DB) {
 
 	fmt.Printf("prefix = %s\n", hex.Dump(prefix))
 	fmt.Printf("Found %d keys\n", loop)
-	fmt.Printf("\nHistogram of key sizes (in bytes)\n")
-	keySizeHistogram.PrintHistogram()
-	fmt.Printf("\nHistogram of value sizes (in bytes)\n")
-	valueSizeHistogram.PrintHistogram()
+	fmt.Printf("\nHistogram of key sizes (in bytes) %s\n", keySizeHistogram.String())
+	fmt.Printf("\nHistogram of value sizes (in bytes) %s\n", valueSizeHistogram.String())
 }
 
 func printAlphaProposal(buf *bytes.Buffer, pr *pb.Proposal, pending map[uint64]bool) {
@@ -886,6 +798,51 @@ func printZeroProposal(buf *bytes.Buffer, zpr *pb.ZeroProposal) {
 	}
 }
 
+func printSummary(db *badger.DB) {
+	nsFromKey := func(key []byte) uint64 {
+		pk, err := x.Parse(key)
+		if err != nil {
+			// Some of the keys are badger's internal and couldn't be parsed.
+			// Hence, the error is expected in that case.
+			fmt.Printf("Unable to parse key: %#x\n", key)
+			return x.GalaxyNamespace
+		}
+		return x.ParseNamespace(pk.Attr)
+	}
+	banned := db.BannedNamespaces()
+	bannedNs := make(map[uint64]struct{})
+	for _, ns := range banned {
+		bannedNs[ns] = struct{}{}
+	}
+
+	tables := db.Tables()
+	levelSizes := make([]uint64, len(db.Levels()))
+	nsSize := make(map[uint64]uint64)
+	for _, tab := range tables {
+		levelSizes[tab.Level] += uint64(tab.OnDiskSize)
+		if nsFromKey(tab.Left) == nsFromKey(tab.Right) {
+			nsSize[nsFromKey(tab.Left)] += uint64(tab.OnDiskSize)
+		}
+	}
+
+	fmt.Println("[SUMMARY]")
+	totalSize := uint64(0)
+	for i, sz := range levelSizes {
+		fmt.Printf("Level %d size: %12s\n", i, humanize.IBytes(sz))
+		totalSize += sz
+	}
+	fmt.Printf("Total SST size: %12s\n", humanize.IBytes(totalSize))
+	fmt.Println()
+	for ns, sz := range nsSize {
+		fmt.Printf("Namespace %#x size: %12s", ns, humanize.IBytes(sz))
+		if _, ok := bannedNs[ns]; ok {
+			fmt.Printf(" (banned)")
+		}
+		fmt.Println()
+	}
+	fmt.Println()
+}
+
 func run() {
 	go func() {
 		for i := 8080; i < 9080; i++ {
@@ -931,6 +888,11 @@ func run() {
 	// Not using posting list cache
 	posting.Init(db, 0)
 	defer db.Close()
+
+	printSummary(db)
+	if opt.onlySummary {
+		return
+	}
 
 	// Commenting the following out because on large Badger DBs, this can take a LONG time.
 	// min, max := getMinMax(db, opt.readTs)

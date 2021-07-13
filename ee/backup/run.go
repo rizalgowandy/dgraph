@@ -90,6 +90,7 @@ func runLsbackupCmd() error {
 	type backupEntry struct {
 		Path           string              `json:"path"`
 		Since          uint64              `json:"since"`
+		ReadTs         uint64              `json:"read_ts"`
 		BackupId       string              `json:"backup_id"`
 		BackupNum      uint64              `json:"backup_num"`
 		Encrypted      bool                `json:"encrypted"`
@@ -105,7 +106,8 @@ func runLsbackupCmd() error {
 
 		be := backupEntry{
 			Path:      manifest.Path,
-			Since:     manifest.Since,
+			Since:     manifest.SinceTsDeprecated,
+			ReadTs:    manifest.ReadTs,
 			BackupId:  manifest.BackupId,
 			BackupNum: manifest.BackupNum,
 			Encrypted: manifest.Encrypted,
@@ -215,11 +217,7 @@ func (bw *bufWriter) Write(buf *z.Buffer) error {
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	buf.Release()
-	return nil
+	return errors.Wrap(err, "bufWriter failed to write")
 }
 
 func runExportBackup() error {
@@ -269,13 +267,13 @@ func runExportBackup() error {
 			EncryptionKeyFile: encFlag.GetPath("key-file"),
 			RestoreTs:         1,
 		}
-		if err := worker.RunMapper(req, mapDir); err != nil {
+		if _, err := worker.RunMapper(req, mapDir); err != nil {
 			return errors.Wrap(err, "Failed to map the backups")
 		}
 
 		in := &pb.ExportRequest{
 			GroupId:     uint32(gid),
-			ReadTs:      latestManifest.Since,
+			ReadTs:      latestManifest.ValidReadTs(),
 			UnixTs:      time.Now().Unix(),
 			Format:      opt.format,
 			Destination: exportDir,

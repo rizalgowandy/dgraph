@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -93,7 +94,7 @@ func WaitForRestore(t *testing.T, dg *dgo.Dgraph) {
 	   }}`)
 
 		if err == nil {
-			numSuccess += 1
+			numSuccess++
 		} else {
 			require.Contains(t, err.Error(), "the server is in draining mode")
 			numSuccess = 0
@@ -178,8 +179,7 @@ func readSchema(pdir string, dType dataType) ([]string, error) {
 	defer db.Close()
 	values := make([]string, 0)
 
-	// Predicates and types in the schema are written with timestamp 1.
-	txn := db.NewTransactionAt(1, false)
+	txn := db.NewTransactionAt(math.MaxUint64, false)
 	defer txn.Discard()
 	itr := txn.NewIterator(badger.DefaultIteratorOptions)
 	defer itr.Close()

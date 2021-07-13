@@ -118,7 +118,9 @@ func init() {
 	flag.Bool("new_uids", false,
 		"Ignore UIDs in load files and assign new ones.")
 	flag.Uint64("force-namespace", math.MaxUint64,
-		"Namespace onto which to load the data. If not set, will preserve the namespace.")
+		"Namespace onto which to load the data. If not set, will preserve the namespace."+
+			" When using this flag to load data into specific namespace, make sure that the "+
+			"load data do not have ACL data.")
 
 	flag.String("badger", BulkBadgerDefaults, z.NewSuperFlagHelp(BulkBadgerDefaults).
 		Head("Badger options (Refer to badger documentation for all possible options)").
@@ -328,6 +330,7 @@ func run() {
 
 		loader.prog.mapEdgeCount = bulkMeta.EdgeCount
 		loader.schema.schemaMap = bulkMeta.SchemaMap
+		loader.schema.types = bulkMeta.Types
 	} else {
 		loader.mapStage()
 		mergeMapShardsIntoReduceShards(&opt)
@@ -336,6 +339,7 @@ func run() {
 		bulkMeta := pb.BulkMeta{
 			EdgeCount: loader.prog.mapEdgeCount,
 			SchemaMap: loader.schema.schemaMap,
+			Types:     loader.schema.types,
 		}
 		bulkMetaData, err := bulkMeta.Marshal()
 		if err != nil {

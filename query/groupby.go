@@ -25,7 +25,7 @@ import (
 	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/types"
-	"github.com/dgraph-io/roaring/roaring64"
+	"github.com/dgraph-io/sroar"
 	"github.com/pkg/errors"
 )
 
@@ -132,11 +132,12 @@ func (d *dedup) addValue(attr string, value types.Val, uid uint64) {
 		// If this is the first element of the group.
 		cur.elements[strKey] = groupElements{
 			key:      value,
-			entities: &pb.List{Uids: []uint64{}},
+			entities: &pb.List{},
 		}
 	}
-	curEntity := cur.elements[strKey].entities
-	curEntity.Uids = append(curEntity.Uids, uid)
+	r := codec.FromList(cur.elements[strKey].entities)
+	r.Set(uid)
+	cur.elements[strKey].entities.Bitmap = codec.ToBytes(r)
 }
 
 func aggregateGroup(grp *groupResult, child *SubGraph) (types.Val, error) {
@@ -144,10 +145,12 @@ func aggregateGroup(grp *groupResult, child *SubGraph) (types.Val, error) {
 		name: child.SrcFunc.Name,
 	}
 	for _, uid := range grp.uids {
-		idx := sort.Search(len(child.SrcUIDs.Uids), func(i int) bool {
-			return child.SrcUIDs.Uids[i] >= uid
+		// TODO(Ahsan): We can have Rank API on sroar.
+		uids := codec.GetUids(child.SrcUIDs)
+		idx := sort.Search(len(uids), func(i int) bool {
+			return uids[i] >= uid
 		})
-		if idx == len(child.SrcUIDs.Uids) || child.SrcUIDs.Uids[idx] != uid {
+		if idx == len(uids) || uids[idx] != uid {
 			continue
 		}
 
@@ -168,15 +171,16 @@ func aggregateGroup(grp *groupResult, child *SubGraph) (types.Val, error) {
 // group.
 func (res *groupResults) formGroups(dedupMap dedup, cur *pb.List, groupVal []groupPair) {
 	l := len(groupVal)
-	if len(dedupMap.groups) == 0 || (l != 0 && len(cur.Uids) == 0) {
+	uids := codec.GetUids(cur)
+	if len(dedupMap.groups) == 0 || (l != 0 && len(uids) == 0) {
 		// This group is already empty or no group can be formed. So stop.
 		return
 	}
 
 	if l == len(dedupMap.groups) {
-		a := make([]uint64, len(cur.Uids))
+		a := make([]uint64, len(uids))
 		b := make([]groupPair, len(groupVal))
-		copy(a, cur.Uids)
+		copy(a, uids)
 		copy(b, groupVal)
 		res.group = append(res.group, &groupResult{
 			uids: a,
@@ -187,20 +191,20 @@ func (res *groupResults) formGroups(dedupMap dedup, cur *pb.List, groupVal []gro
 
 	curmap := codec.FromList(cur)
 	for _, v := range dedupMap.groups[l].elements {
-		temp := new(pb.List)
+		temp := sroar.NewBitmap()
 		groupVal = append(groupVal, groupPair{
 			key:  v.key,
 			attr: dedupMap.groups[l].attr,
 		})
 		if l != 0 {
 			ve := codec.FromList(v.entities)
-			r := roaring64.And(curmap, ve)
-			temp = codec.ToList(r)
+			r := sroar.And(curmap, ve)
+			temp = r
 		} else {
-			temp.Uids = make([]uint64, len(v.entities.Uids))
-			copy(temp.Uids, v.entities.Uids)
+			vuids := codec.GetUids(v.entities)
+			temp.SetMany(vuids)
 		}
-		res.formGroups(dedupMap, temp, groupVal)
+		res.formGroups(dedupMap, codec.ToList(temp), groupVal)
 		groupVal = groupVal[:len(groupVal)-1]
 	}
 }
@@ -218,24 +222,25 @@ func (sg *SubGraph) formResult(ul *pb.List) (*groupResults, error) {
 		if attr == "" {
 			attr = child.Attr
 		}
+		childUids := codec.GetUids(child.SrcUIDs)
 		if !child.DestMap.IsEmpty() {
 			// It's a UID node.
 			for i := 0; i < len(child.uidMatrix); i++ {
-				srcUid := child.SrcUIDs.Uids[i]
+				srcUid := childUids[i]
 				// Ignore uids which are not part of srcUid.
 				if algo.IndexOf(ul, srcUid) < 0 {
 					continue
 				}
 
 				ul := child.uidMatrix[i]
-				for _, uid := range ul.GetUids() {
+				for _, uid := range codec.GetUids(ul) {
 					dedupMap.addValue(attr, types.Val{Tid: types.UidID, Value: uid}, srcUid)
 				}
 			}
 		} else {
 			// It's a value node.
 			for i, v := range child.valueMatrix {
-				srcUid := child.SrcUIDs.Uids[i]
+				srcUid := childUids[i]
 				if len(v.Values) == 0 || algo.IndexOf(ul, srcUid) < 0 {
 					continue
 				}
@@ -290,30 +295,52 @@ func (sg *SubGraph) fillGroupedVars(doneVars map[string]varValue, path []*SubGra
 
 	var pathNode *SubGraph
 	var dedupMap dedup
-
+	// uidPredicate is true when atleast one argument to
+	// the groupby is uid predicate.
+	uidPredicate := false
 	for _, child := range sg.Children {
 		if !child.Params.IgnoreResult {
 			continue
 		}
+		uidPredicate = uidPredicate || !child.DestMap.IsEmpty()
 
 		attr := child.Params.Alias
 		if attr == "" {
 			attr = child.Attr
 		}
+		childUids := codec.GetUids(child.SrcUIDs)
 		if !child.DestMap.IsEmpty() {
 			// It's a UID node.
 			for i := 0; i < len(child.uidMatrix); i++ {
-				srcUid := child.SrcUIDs.Uids[i]
+				srcUid := childUids[i]
 				ul := child.uidMatrix[i]
-				for _, uid := range ul.Uids {
+				ulUids := codec.GetUids(ul)
+				for _, uid := range ulUids {
 					dedupMap.addValue(attr, types.Val{Tid: types.UidID, Value: uid}, srcUid)
 				}
 			}
 			pathNode = child
 		} else {
 			// It's a value node.
+
+			// Currently vars are supported only at the root.
+			// for eg, The following query will result into error:-
+			// 	v as var(func: uid(1,31)) {
+			// 		name
+			// 		friend @groupby(age) {
+			// 			a as count(uid)
+			// 		}
+			// 	}
+			// since `a` is a global variable which stores (uid, val) pair for
+			// all the srcUids (1 & 31 in this case), we can't store distinct
+			// vals for same uid locally. This will eventually lead to incorrect
+			// results.
+			if sg.SrcFunc == nil {
+				return errors.Errorf("Vars can be assigned only at root when grouped by Value")
+			}
+
 			for i, v := range child.valueMatrix {
-				srcUid := child.SrcUIDs.Uids[i]
+				srcUid := childUids[i]
 				if len(v.Values) == 0 {
 					continue
 				}
@@ -352,17 +379,35 @@ func (sg *SubGraph) fillGroupedVars(doneVars map[string]varValue, path []*SubGra
 			if len(grp.keys) == 0 {
 				continue
 			}
-			if len(grp.keys) > 1 {
-				return errors.Errorf("Expected one UID for var in groupby but got: %d", len(grp.keys))
-			}
-			uidVal := grp.keys[0].key.Value
-			uid, ok := uidVal.(uint64)
-			if !ok {
-				return errors.Errorf("Vars can be assigned only when grouped by UID attribute")
-			}
-			// grp.aggregates could be empty if schema conversion failed during aggregation
-			if len(grp.aggregates) > 0 {
-				tempMap[uid] = grp.aggregates[len(grp.aggregates)-1].key
+
+			if len(grp.keys) == 1 && grp.keys[0].key.Tid == types.UidID {
+				uidVal := grp.keys[0].key.Value
+				uid, _ := uidVal.(uint64)
+				// grp.aggregates could be empty if schema conversion failed during aggregation
+				if len(grp.aggregates) > 0 {
+					tempMap[uid] = grp.aggregates[len(grp.aggregates)-1].key
+				}
+			} else {
+				// if there are more than one predicates or a single scalar
+				// predicate in the @groupby then the variable stores the mapping of
+				// uid -> count of duplicates. for eg if there are two predicates(u & v) and
+				// the grouped uids for (u1, v1) pair are (uid1, uid2, uid3) then the variable
+				// stores (uid1, 3), (uid2, 3) & (uid2, 2) map.
+				// For the query given below:-
+				// 	var(func: type(Student)) @groupby(school, age) {
+				// 		c as count(uid)
+				// 	}
+				// if the grouped result is:-
+				// (s1, age1) -> "0x1", "0x2", "0x3"
+				// (s2, age2) -> "0x4"
+				// (s3, ag3) -> "0x5","0x6"
+				// then `c` will store the mapping:-
+				// {"0x1" -> 3, "0x2" -> 3, "0x3" -> 3, "0x4" -> 1, "0x5" -> 2, "0x6"-> 2}
+				for _, uid := range grp.uids {
+					if len(grp.aggregates) > 0 {
+						tempMap[uid] = grp.aggregates[len(grp.aggregates)-1].key
+					}
+				}
 			}
 		}
 		doneVars[chVar] = varValue{

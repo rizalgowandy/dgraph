@@ -30,7 +30,7 @@ import (
 	bpb "github.com/dgraph-io/badger/v3/pb"
 	"github.com/dgraph-io/dgo/v210/protos/api"
 	"github.com/dgraph-io/ristretto/z"
-	"github.com/dgraph-io/roaring/roaring64"
+	"github.com/dgraph-io/sroar"
 	"github.com/gogo/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -474,7 +474,7 @@ func TestMillion(t *testing.T) {
 	opt := ListOptions{ReadTs: uint64(N) + 1}
 	bm, err := ol.Bitmap(opt)
 	require.NoError(t, err)
-	require.Equal(t, uint64(commits), bm.GetCardinality())
+	require.Equal(t, commits, bm.GetCardinality())
 
 	uids := bm.ToArray()
 	for i, uid := range uids {
@@ -502,8 +502,8 @@ func TestAddMutation_mrjn2(t *testing.T) {
 		opt := ListOptions{ReadTs: uint64(i)}
 		list, err := ol.Uids(opt)
 		require.NoError(t, err)
-		require.EqualValues(t, 1, len(list.Uids))
-		require.EqualValues(t, uint64(i), list.Uids[0])
+		require.EqualValues(t, 1, codec.ListCardinality(list))
+		require.EqualValues(t, uint64(i), codec.GetUids(list)[0])
 	}
 	require.EqualValues(t, 0, ol.Length(readTs, 0))
 	require.NoError(t, ol.commitMutation(1, 0))
@@ -557,13 +557,14 @@ func TestAddMutation_mrjn2(t *testing.T) {
 		opts := ListOptions{ReadTs: 15}
 		list, err := ol.Uids(opts)
 		require.NoError(t, err)
-		require.EqualValues(t, 7, list.Uids[0])
-		require.EqualValues(t, 9, list.Uids[1])
+		uids := codec.GetUids(list)
+		require.EqualValues(t, 7, uids[0])
+		require.EqualValues(t, 9, uids[1])
 	}
 }
 
 func TestAddMutation_gru(t *testing.T) {
-	key := x.DataKey("question.tag", 0x01)
+	key := x.DataKey(x.GalaxyAttr("question.tag"), 0x01)
 	ol, err := getNew(key, ps, math.MaxUint64)
 	require.NoError(t, err)
 
@@ -596,7 +597,7 @@ func TestAddMutation_gru(t *testing.T) {
 }
 
 func TestAddMutation_gru2(t *testing.T) {
-	key := x.DataKey("question.tag", 0x100)
+	key := x.DataKey(x.GalaxyAttr("question.tag"), 0x100)
 	ol, err := getNew(key, ps, math.MaxUint64)
 	require.NoError(t, err)
 
@@ -643,7 +644,7 @@ func TestAddMutation_gru2(t *testing.T) {
 func TestAddAndDelMutation(t *testing.T) {
 	// Ensure each test uses unique key since we don't clear the postings
 	// after each test
-	key := x.DataKey("dummy_key", 0x927)
+	key := x.DataKey(x.GalaxyAttr("dummy_key"), 0x927)
 	ol, err := getNew(key, ps, math.MaxUint64)
 	require.NoError(t, err)
 
@@ -882,7 +883,7 @@ func createMultiPartList(t *testing.T, size int, addFacet bool) (*List, int) {
 	defer setMaxListSize(maxListSize)
 	maxListSize = 5000
 
-	key := x.DataKey(uuid.New().String(), 1331)
+	key := x.DataKey(x.GalaxyAttr(uuid.New().String()), 1331)
 	ol, err := getNew(key, ps, math.MaxUint64)
 	require.NoError(t, err)
 	commits := 0
@@ -900,6 +901,7 @@ func createMultiPartList(t *testing.T, size int, addFacet bool) (*List, int) {
 		addMutationHelper(t, ol, edge, Set, &txn)
 		require.NoError(t, ol.commitMutation(uint64(i), uint64(i)+1))
 		if i%2000 == 0 {
+			t.Logf("Rolling up keys. i=%d\n", i)
 			kvs, err := ol.Rollup(nil)
 			require.NoError(t, err)
 			require.NoError(t, writePostingListToDisk(kvs))
@@ -930,7 +932,7 @@ func createAndDeleteMultiPartList(t *testing.T, size int) (*List, int) {
 	defer setMaxListSize(maxListSize)
 	maxListSize = 1000
 
-	key := x.DataKey(uuid.New().String(), 1331)
+	key := x.DataKey(x.GalaxyAttr(uuid.New().String()), 1331)
 	ol, err := getNew(key, ps, math.MaxUint64)
 	require.NoError(t, err)
 	commits := 0
@@ -982,7 +984,7 @@ func TestLargePlistSplit(t *testing.T) {
 	key := x.DataKey(uuid.New().String(), 1331)
 	ol, err := getNew(key, ps, math.MaxUint64)
 	require.NoError(t, err)
-	b := make([]byte, 30<<20)
+	b := make([]byte, 5<<20)
 	rand.Read(b)
 	for i := 1; i <= 2; i++ {
 		edge := &pb.DirectedEdge{
@@ -999,7 +1001,7 @@ func TestLargePlistSplit(t *testing.T) {
 
 	ol, err = getNew(key, ps, math.MaxUint64)
 	require.NoError(t, err)
-	b = make([]byte, 10<<20)
+	b = make([]byte, 5<<20)
 	rand.Read(b)
 	for i := 0; i < 63; i++ {
 		edge := &pb.DirectedEdge{
@@ -1035,7 +1037,7 @@ func TestDeleteStarMultiPartList(t *testing.T) {
 	validateCount := func(expected int) {
 		bm, err := list.Bitmap(ListOptions{ReadTs: math.MaxUint64})
 		require.NoError(t, err)
-		require.Equal(t, uint64(expected), bm.GetCardinality())
+		require.Equal(t, expected, bm.GetCardinality())
 	}
 	validateCount(numEdges)
 
@@ -1069,13 +1071,16 @@ func writePostingListToDisk(kvs []*bpb.KV) error {
 
 // Create a multi-part list and verify all the uids are there.
 func TestMultiPartListBasic(t *testing.T) {
-	size := int(1e5)
+	// TODO(sroar): Increase size to 1e5 once sroar is optimized.
+	// size := int(1e5)
+	size := int(6000)
 	ol, commits := createMultiPartList(t, size, false)
 	opt := ListOptions{ReadTs: uint64(size) + 1}
 	l, err := ol.Uids(opt)
 	require.NoError(t, err)
-	require.Equal(t, commits, len(l.Uids), "List of Uids received: %+v", l.Uids)
-	for i, uid := range l.Uids {
+	uids := codec.GetUids(l)
+	require.Equal(t, commits, len(uids), "List of Uids received: %+v", uids)
+	for i, uid := range uids {
 		require.Equal(t, uint64(i+1), uid)
 	}
 }
@@ -1092,7 +1097,7 @@ func TestBinSplit(t *testing.T) {
 		defer func() {
 			maxListSize = originalListSize
 		}()
-		key := x.DataKey(uuid.New().String(), 1331)
+		key := x.DataKey(x.GalaxyAttr(uuid.New().String()), 1331)
 		ol, err := getNew(key, ps, math.MaxUint64)
 		require.NoError(t, err)
 		for i := 1; i <= size; i++ {
@@ -1148,7 +1153,7 @@ func TestBinSplit(t *testing.T) {
 			bm.GetCardinality(), bm.Minimum(), bm.Maximum(),
 			low.GetCardinality(), low.Minimum(), low.Maximum(),
 			high.GetCardinality(), high.Minimum(), high.Maximum())
-		require.Equal(t, uint64(0), roaring64.And(low, high).GetCardinality())
+		require.Equal(t, 0, sroar.And(low, high).GetCardinality())
 		got := append(low.ToArray(), high.ToArray()...)
 		require.Equal(t, len(expected), len(got))
 		require.Equal(t, expected, got)
@@ -1198,23 +1203,28 @@ func TestBinSplit(t *testing.T) {
 
 // Verify that iteration works with an afterUid value greater than zero.
 func TestMultiPartListIterAfterUid(t *testing.T) {
-	size := int(1e5)
+	// TODO(sroar): Revert back size
+	// size := int(1e5)
+	size := int(4000)
 	ol, _ := createMultiPartList(t, size, false)
 
+	after := 2000
 	bm, err := ol.Bitmap(ListOptions{
 		ReadTs:   uint64(size + 1),
-		AfterUid: 50000,
+		AfterUid: uint64(after),
 	})
 	require.NoError(t, err)
-	require.Equal(t, uint64(50000), bm.GetCardinality())
+	require.Equal(t, after, bm.GetCardinality())
 	for i, uid := range bm.ToArray() {
-		require.Equal(t, uint64(50000+i+1), uid)
+		require.Equal(t, uint64(after+i+1), uid)
 	}
 }
 
 // Verify that postings can be retrieved in multi-part lists.
 func TestMultiPartListWithPostings(t *testing.T) {
-	size := int(1e5)
+	// TODO(sroar): Revert back size
+	// size := int(1e5)
+	size := int(1e4)
 	ol, commits := createMultiPartList(t, size, true)
 
 	var facets []string
@@ -1233,7 +1243,9 @@ func TestMultiPartListWithPostings(t *testing.T) {
 
 // Verify marshaling of multi-part lists.
 func TestMultiPartListMarshal(t *testing.T) {
-	size := int(1e5)
+	// TODO(sroar): Revert back size
+	// size := int(1e5)
+	size := int(1e4)
 	ol, _ := createMultiPartList(t, size, false)
 
 	kvs, err := ol.Rollup(nil)
@@ -1261,7 +1273,9 @@ func TestMultiPartListMarshal(t *testing.T) {
 
 // Verify that writing a multi-part list to disk works correctly.
 func TestMultiPartListWriteToDisk(t *testing.T) {
-	size := int(1e5)
+	// TODO(sroar): Revert back size
+	// size := int(1e5)
+	size := int(1e4)
 	originalList, commits := createMultiPartList(t, size, false)
 
 	kvs, err := originalList.Rollup(nil)
@@ -1277,15 +1291,19 @@ func TestMultiPartListWriteToDisk(t *testing.T) {
 	require.NoError(t, err)
 	newUids, err := newList.Uids(opt)
 	require.NoError(t, err)
-	require.Equal(t, commits, len(originalUids.Uids))
-	require.Equal(t, len(originalUids.Uids), len(newUids.Uids))
-	for i := range originalUids.Uids {
-		require.Equal(t, originalUids.Uids[i], newUids.Uids[i])
+	origUids := codec.GetUids(originalUids)
+	newIds := codec.GetUids(newUids)
+	require.Equal(t, commits, len(origUids))
+	require.Equal(t, len(origUids), len(newIds))
+	for i := range origUids {
+		require.Equal(t, origUids[i], newIds[i])
 	}
 }
 
 // Verify that adding and deleting all the entries returns an empty list.
 func TestMultiPartListDelete(t *testing.T) {
+	// TODO(sroar): Revert back size
+	// size := int(1e5)
 	size := int(1e4)
 	ol, commits := createAndDeleteMultiPartList(t, size)
 	require.Equal(t, size*2, commits)
@@ -1311,13 +1329,13 @@ func TestMultiPartListDelete(t *testing.T) {
 // entries have been deleted. Do this by creating a list, deleting the first
 // half, and ensuring iteration and mutation still work as expected.
 func TestMultiPartListDeleteAndAdd(t *testing.T) {
-	size := int(1e5)
+	size := int(6000)
 	// For testing, set the max list size to a lower threshold.
 	defer setMaxListSize(maxListSize)
 	maxListSize = 5000
 
 	// Add entries to the maps.
-	key := x.DataKey(uuid.New().String(), 1331)
+	key := x.DataKey(x.GalaxyAttr(uuid.New().String()), 1331)
 	ol, err := getNew(key, ps, math.MaxUint64)
 	require.NoError(t, err)
 	for i := 1; i <= size; i++ {
@@ -1341,8 +1359,9 @@ func TestMultiPartListDeleteAndAdd(t *testing.T) {
 	opt := ListOptions{ReadTs: math.MaxUint64}
 	l, err := ol.Uids(opt)
 	require.NoError(t, err)
-	require.Equal(t, size, len(l.Uids), "List of Uids received: %+v", l.Uids)
-	for i, uid := range l.Uids {
+	uids := codec.GetUids(l)
+	require.Equal(t, size, len(uids), "List of Uids received: %+v", uids)
+	for i, uid := range uids {
 		require.Equal(t, uint64(i+1), uid)
 	}
 
@@ -1377,14 +1396,15 @@ func TestMultiPartListDeleteAndAdd(t *testing.T) {
 	opt = ListOptions{ReadTs: math.MaxUint64}
 	l, err = ol.Uids(opt)
 	require.NoError(t, err)
-	require.Equal(t, 50000, len(l.Uids), "List of Uids received: %+v", l.Uids)
-	for i, uid := range l.Uids {
-		require.Equal(t, 50000+uint64(i+1), uid)
+	uids = codec.GetUids(l)
+	require.Equal(t, size/2, len(uids), "List of Uids received: %+v", uids)
+	for i, uid := range uids {
+		require.Equal(t, uint64(size/2)+uint64(i+1), uid)
 	}
 
 	// Re-add the entries that were just deleted.
 	baseStartTs = uint64(2*size) + 1
-	for i := 1; i <= 50000; i++ {
+	for i := 1; i <= size/2; i++ {
 		edge := &pb.DirectedEdge{
 			ValueId: uint64(i),
 		}
@@ -1412,15 +1432,18 @@ func TestMultiPartListDeleteAndAdd(t *testing.T) {
 	opt = ListOptions{ReadTs: math.MaxUint64}
 	l, err = ol.Uids(opt)
 	require.NoError(t, err)
-	require.Equal(t, size, len(l.Uids), "List of Uids received: %+v", l.Uids)
-	for i, uid := range l.Uids {
+	uids = codec.GetUids(l)
+	require.Equal(t, size, len(uids), "List of Uids received: %+v", uids)
+	for i, uid := range uids {
 		require.Equal(t, uint64(i+1), uid)
 	}
 }
 
 func TestSingleListRollup(t *testing.T) {
 	// Generate a split posting list.
-	size := int(1e5)
+	// TODO(sroar): Revert back size
+	// size := int(1e5)
+	size := int(1e4)
 	ol, commits := createMultiPartList(t, size, true)
 
 	var facets []string
@@ -1456,7 +1479,7 @@ func TestRecursiveSplits(t *testing.T) {
 
 	// Create a list that should be split recursively.
 	size := int(1e5)
-	key := x.DataKey(uuid.New().String(), 1331)
+	key := x.DataKey(x.GalaxyAttr(uuid.New().String()), 1331)
 	ol, err := getNew(key, ps, math.MaxUint64)
 	require.NoError(t, err)
 	commits := 0
@@ -1507,7 +1530,7 @@ func TestMain(m *testing.M) {
 	dir, err := ioutil.TempDir("", "storetest_")
 	x.Check(err)
 
-	ps, err = badger.OpenManaged(badger.DefaultOptions(dir))
+	ps, err = badger.OpenManaged(badger.DefaultOptions(dir).WithAllowStopTheWorld(false))
 	x.Check(err)
 	// Not using posting list cache
 	Init(ps, 0)

@@ -19,6 +19,7 @@ package posting
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io/ioutil"
@@ -560,7 +561,6 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		WithNumVersionsToKeep(math.MaxInt32).
 		WithLogger(&x.ToGlog{}).
 		WithCompression(options.None).
-		WithEncryptionKey(x.WorkerConfig.EncryptionKey).
 		WithLoggingLevel(badger.WARNING).
 		WithMetricsEnabled(false)
 
@@ -578,7 +578,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 
 	glog.V(1).Infof(
 		"Rebuilding index for predicate %s: Starting process. StartTs=%d. Prefix=\n%s\n",
-		x.FormatNsAttr(r.attr), r.startTs, hex.Dump(r.prefix))
+		r.attr, r.startTs, hex.Dump(r.prefix))
 
 	// Counter is used here to ensure that all keys are committed at different timestamp.
 	// We set it to 1 in case there are no keys found and NewStreamAt is called with ts=0.
@@ -586,8 +586,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 
 	tmpWriter := tmpDB.NewManagedWriteBatch()
 	stream := pstore.NewStreamAt(r.startTs)
-	stream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (1/2):",
-		x.FormatNsAttr(r.attr))
+	stream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (1/2):", r.attr)
 	stream.Prefix = r.prefix
 	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
 		// We should return quickly if the context is no longer valid.
@@ -616,7 +615,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		}
 
 		// Convert data into deltas.
-		txn.Update()
+		txn.Update(ctx)
 
 		// txn.cache.Lock() is not required because we are the only one making changes to txn.
 		kvs := make([]*bpb.KV, 0, len(txn.cache.deltas))
@@ -649,21 +648,19 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		return err
 	}
 	glog.V(1).Infof("Rebuilding index for predicate %s: building temp index took: %v\n",
-		x.FormatNsAttr(r.attr), time.Since(start))
+		r.attr, time.Since(start))
 
 	// Now we write all the created posting lists to disk.
-	glog.V(1).Infof("Rebuilding index for predicate %s: writing index to badger",
-		x.FormatNsAttr(r.attr))
+	glog.V(1).Infof("Rebuilding index for predicate %s: writing index to badger", r.attr)
 	start = time.Now()
 	defer func() {
 		glog.V(1).Infof("Rebuilding index for predicate %s: writing index took: %v\n",
-			x.FormatNsAttr(r.attr), time.Since(start))
+			r.attr, time.Since(start))
 	}()
 
 	writer := pstore.NewManagedWriteBatch()
 	tmpStream := tmpDB.NewStreamAt(counter)
-	tmpStream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (2/2):",
-		x.FormatNsAttr(r.attr))
+	tmpStream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (2/2):", r.attr)
 	tmpStream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
 		l, err := ReadPostingList(key, itr)
 		if err != nil {
@@ -706,8 +703,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 	if err := tmpStream.Orchestrate(ctx); err != nil {
 		return err
 	}
-	glog.V(1).Infof("Rebuilding index for predicate %s: Flushing all writes.\n",
-		x.FormatNsAttr(r.attr))
+	glog.V(1).Infof("Rebuilding index for predicate %s: Flushing all writes.\n", r.attr)
 	return writer.Flush()
 }
 
@@ -1222,20 +1218,34 @@ func DeleteAll() error {
 	return pstore.DropAll()
 }
 
-// DeleteData deletes all data but leaves types and schema intact.
-func DeleteData() error {
-	return pstore.DropPrefix([]byte{x.DefaultPrefix})
+// DeleteData deletes all data for the namespace but leaves types and schema intact.
+func DeleteData(ns uint64) error {
+	prefix := make([]byte, 9)
+	prefix[0] = x.DefaultPrefix
+	binary.BigEndian.PutUint64(prefix[1:], ns)
+	return pstore.DropPrefix(prefix)
 }
 
-// DeletePredicate deletes all entries and indices for a given predicate.
-func DeletePredicate(ctx context.Context, attr string) error {
+// DeletePredicate deletes all entries and indices for a given predicate. The delete may be logical
+// based on DB options set.
+func DeletePredicate(ctx context.Context, attr string, ts uint64) error {
 	glog.Infof("Dropping predicate: [%s]", attr)
 	prefix := x.PredicatePrefix(attr)
 	if err := pstore.DropPrefix(prefix); err != nil {
 		return err
 	}
+	return schema.State().Delete(attr, ts)
+}
 
-	return schema.State().Delete(attr)
+// DeletePredicateBlocking deletes all entries and indices for a given predicate. It also blocks the
+// writes.
+func DeletePredicateBlocking(ctx context.Context, attr string, ts uint64) error {
+	glog.Infof("Dropping predicate: [%s]", attr)
+	prefix := x.PredicatePrefix(attr)
+	if err := pstore.DropPrefixBlocking(prefix); err != nil {
+		return err
+	}
+	return schema.State().Delete(attr, ts)
 }
 
 // DeleteNamespace bans the namespace and deletes its predicates/types from the schema.
